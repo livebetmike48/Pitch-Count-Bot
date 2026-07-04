@@ -42,6 +42,7 @@ def summarize_outings(splits: list[dict], n: int, starts_only: bool = True) -> d
     total_bb = sum(s["bb"] for s in recent)
     total_h = sum(s["hits"] for s in recent)
     total_pitches = sum(s["pitches"] for s in recent)
+    total_bf = sum(s.get("bf", 0) for s in recent)
 
     era = (total_er * 9 / total_ip) if total_ip > 0 else None
     k9 = (total_so * 9 / total_ip) if total_ip > 0 else None
@@ -56,6 +57,9 @@ def summarize_outings(splits: list[dict], n: int, starts_only: bool = True) -> d
         "avg_pitches": round(total_pitches / len(recent), 1),
         "total_er": total_er,
         "total_so": total_so,
+        "total_bb": total_bb,
+        "total_h": total_h,
+        "total_bf": total_bf,
     }
 
 
@@ -68,3 +72,49 @@ def hot_cold_tag(summary: dict | None) -> str | None:
     if summary["era"] >= COLD_ERA_THRESHOLD:
         return "🥶 Cold"
     return None
+
+
+# --- Pitcher streaks ---
+# Each streak requires the threshold to hold for EVERY start across a fairly
+# long run (not just a couple games) -- that length requirement is what
+# keeps this meaningful even for elite pitchers, since a single off-night
+# resets the whole streak. A great strikeout pitcher having a rough outing
+# somewhere in the last 9 starts is common enough that surviving all 9 with
+# 6+ Ks every time is still a real, notable accomplishment, not a given.
+STREAK_DEFS = {
+    "hits_allowed": {"threshold": 5, "min_length": 5,
+                      "label": lambda n: f"🔴 Allowed 5+ hits in {n} straight starts"},
+    "bb": {"threshold": 2, "min_length": 10,
+           "label": lambda n: f"🟡 2+ walks in {n} straight starts"},
+    "so": {"threshold": 6, "min_length": 9,
+           "label": lambda n: f"🔥 6+ strikeouts in {n} straight starts"},
+}
+
+
+def current_start_streak(splits: list[dict], stat_key: str, threshold: int) -> int:
+    """Counts consecutive STARTS (most recent backward) where stat_key >= threshold."""
+    starts = [s for s in splits if s.get("is_start")]
+    streak = 0
+    for s in reversed(starts):
+        if s.get(stat_key, 0) >= threshold:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def get_pitcher_streaks(splits: list[dict]) -> dict:
+    return {
+        "hits_allowed": current_start_streak(splits, "hits", STREAK_DEFS["hits_allowed"]["threshold"]),
+        "bb": current_start_streak(splits, "bb", STREAK_DEFS["bb"]["threshold"]),
+        "so": current_start_streak(splits, "so", STREAK_DEFS["so"]["threshold"]),
+    }
+
+
+def notable_pitcher_streak_labels(streaks: dict) -> list[str]:
+    labels = []
+    for key, length in streaks.items():
+        min_len = STREAK_DEFS[key]["min_length"]
+        if length >= min_len:
+            labels.append(STREAK_DEFS[key]["label"](length))
+    return labels

@@ -1,6 +1,7 @@
 import os
 import logging
-from datetime import datetime, timedelta, timezone
+import asyncio
+from datetime import datetime, timedelta, timezone, time as dtime
 
 import discord
 from discord import app_commands
@@ -304,11 +305,18 @@ class StartersBot(discord.Client):
         date_str = date or et_date_str(0)
 
         try:
-            entries = mlb_api.get_probable_starters(date_str)
+            lines = await asyncio.to_thread(self._build_starters_lines_sync, date_str)
         except Exception as e:
             await interaction.followup.send(f"Couldn't reach the MLB API right now: {e}")
             return
 
+        header = f"__**Probable Starters — {date_str}**__\n\n"
+        await self._send_chunked(interaction, header, lines)
+
+    def _build_starters_lines_sync(self, date_str: str) -> list[str]:
+        """Synchronous version for asyncio.to_thread -- avoids blocking the
+        event loop during the ~30 sequential API calls this makes."""
+        entries = mlb_api.get_probable_starters(date_str)
         entries_by_team = {e["team_id"]: e for e in entries}
         lines = []
         for team in sorted(self.teams, key=lambda t: t["name"]):
@@ -335,9 +343,7 @@ class StartersBot(discord.Client):
                 log.error("Game log lookup failed for %s: %s", entry["pitcher_name"], e)
 
             lines.append(f"**{team['name']}**\n{entry['pitcher_name']} makes the start. {last_pitch_line}.\n")
-
-        header = f"__**Probable Starters — {date_str}**__\n\n"
-        await self._send_chunked(interaction, header, lines)
+        return lines
 
     async def _hotstarters_callback(self, interaction: discord.Interaction, date: str | None = None):
         await self._hot_or_cold(interaction, date, want_tag="🔥 Hot", label="Hot", emoji="🔥")
@@ -407,6 +413,8 @@ class StartersBot(discord.Client):
             refresh_directory_loop.start(self)
         if not watchdog.is_running():
             watchdog.start()
+        if not scheduled_starters_post.is_running():
+            scheduled_starters_post.start(self)
 
 
 client = StartersBot()
@@ -489,10 +497,65 @@ async def watchdog():
     if not refresh_directory_loop.is_running():
         log.error("refresh_directory_loop was found stopped -- restarting it now")
         refresh_directory_loop.start(client)
+    if not scheduled_starters_post.is_running():
+        log.error("scheduled_starters_post was found stopped -- restarting it now")
+        scheduled_starters_post.start(client)
 
 
 @watchdog.before_loop
 async def before_watchdog():
+    await client.wait_until_ready()
+
+
+# 10 PM ET the night before, and 11 AM ET the day of -- approximated as
+# UTC-4 (matches the rest of this bot's ET handling; will drift by an hour
+# during EST in the off-season, same known limitation as elsewhere here).
+# 10 PM ET = 02:00 UTC (next day). 11 AM ET = 15:00 UTC.
+SCHEDULED_TIMES = [dtime(hour=2, minute=0), dtime(hour=15, minute=0)]
+
+
+@tasks.loop(time=SCHEDULED_TIMES)
+async def scheduled_starters_post(bot: StartersBot):
+    try:
+        channel_id = storage.get_config("announce_channel_id")
+        if not channel_id:
+            return
+        channel = bot.get_channel(int(channel_id))
+        if channel is None:
+            return
+
+        now_utc = datetime.now(timezone.utc)
+        if now_utc.hour < 6:
+            # This is the 02:00 UTC run (10 PM ET the night before) -- post TOMORROW's slate
+            date_str = et_date_str(1)
+            label = "Tomorrow's"
+        else:
+            # This is the 15:00 UTC run (11 AM ET day-of) -- post TODAY's slate
+            date_str = et_date_str(0)
+            label = "Today's"
+
+        try:
+            lines = await asyncio.to_thread(bot._build_starters_lines_sync, date_str)
+        except Exception as e:
+            log.error("Scheduled starters post failed to fetch data for %s: %s", date_str, e)
+            return
+
+        header = f"__**{label} Probable Starters — {date_str}**__\n\n"
+        chunk = header
+        for line in lines:
+            if len(chunk) + len(line) > 1900:
+                await channel.send(chunk)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk.strip():
+            await channel.send(chunk)
+        log.info("Posted scheduled starters report for %s", date_str)
+    except Exception as e:
+        log.error("scheduled_starters_post cycle failed unexpectedly, will retry next scheduled time: %s", e)
+
+
+@scheduled_starters_post.before_loop
+async def before_scheduled_starters_post():
     await client.wait_until_ready()
 
 

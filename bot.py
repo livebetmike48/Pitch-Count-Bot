@@ -1,6 +1,5 @@
 import os
 import logging
-import io
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -10,7 +9,6 @@ from discord.ext import tasks
 import mlb_api
 import storage
 import stats
-import card
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -185,14 +183,6 @@ class StartersBot(discord.Client):
         self.tree.add_command(pitcher_cmd)
         pitcher_cmd.autocomplete("name")(self._name_autocomplete)
 
-        pitchercard_cmd = app_commands.Command(
-            name="pitchercard",
-            description="Visual stat card: ERA/K9/WHIP/BB9, W-L, hot/cold, streaks",
-            callback=self._pitchercard_callback,
-        )
-        self.tree.add_command(pitchercard_cmd)
-        pitchercard_cmd.autocomplete("name")(self._name_autocomplete)
-
         setchannel_cmd = app_commands.Command(
             name="setchannel",
             description="Set this channel to receive starter pitch count reports",
@@ -302,41 +292,6 @@ class StartersBot(discord.Client):
             await interaction.followup.send(f"Couldn't reach the MLB API right now: {e}")
             return
         await interaction.followup.send(embed=build_pitcher_embed(pitcher_name, splits))
-
-    async def _pitchercard_callback(self, interaction: discord.Interaction, name: str):
-        await interaction.response.defer()
-        person_id, pitcher_name = self._resolve_pitcher(name)
-        if person_id is None:
-            await interaction.followup.send(
-                f"Couldn't find a pitcher matching '{name}' on an active roster. "
-                f"Try selecting from the suggestions as you type."
-            )
-            return
-        try:
-            splits = mlb_api.get_pitcher_game_log(person_id)
-        except Exception as e:
-            await interaction.followup.send(f"Couldn't reach the MLB API right now: {e}")
-            return
-
-        if not splits:
-            await interaction.followup.send("No game log found for this pitcher this season yet.")
-            return
-
-        season = stats.summarize_outings(splits, len(splits))
-        last10 = stats.summarize_outings(splits, 10)
-        tag = stats.hot_cold_tag(last10)
-        pitcher_streaks = stats.get_pitcher_streaks(splits)
-        notable = stats.notable_pitcher_streak_labels(pitcher_streaks)
-
-        try:
-            png_bytes = card.build_pitcher_card(pitcher_name, "", season, tag, notable, player_id=person_id)
-        except Exception as e:
-            log.error("Card generation failed for %s: %s", pitcher_name, e)
-            await interaction.followup.send(f"Couldn't generate the card: {e}")
-            return
-
-        file = discord.File(io.BytesIO(png_bytes), filename=f"{pitcher_name.replace(' ', '_')}_card.png")
-        await interaction.followup.send(file=file)
 
     async def _setchannel_callback(self, interaction: discord.Interaction):
         storage.set_config("announce_channel_id", str(interaction.channel_id))
